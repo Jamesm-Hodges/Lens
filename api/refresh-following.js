@@ -7,6 +7,10 @@
 // through all accounts over time — no manual work needed.
 import { createClient } from '@supabase/supabase-js';
 
+// Set the function timeout HERE so it doesn't depend on vercel.json being picked up.
+// Pro allows up to 300; 60 is plenty with our 40s time budget below.
+export const config = { maxDuration: 60 };
+
 const supabase = createClient(
   process.env.LENS_SUPABASE_URL,
   process.env.LENS_SUPABASE_SERVICE_KEY,
