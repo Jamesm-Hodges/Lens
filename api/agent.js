@@ -19,6 +19,8 @@ const LLM_URL = (process.env.LLM_API_URL || 'https://api.venice.ai/api/v1').repl
 const LLM_MODEL = process.env.LLM_MODEL || 'llama-3.3-70b';
 const TWITTERAPI_KEY = process.env.TWITTERAPI_KEY;
 const SELF = 'https://lens-liard.vercel.app';
+const SUPABASE_URL = (process.env.LENS_SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_ANON = process.env.LENS_SUPABASE_ANON_KEY;
 
 // Only let our own surfaces call this (soft guard against random embeds / cost abuse).
 const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io', 'https://x.com', 'https://twitter.com', 'http://localhost'];
@@ -26,12 +28,12 @@ const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io', 'https://x.com', 'https
 const PERSONA = [
   'You are LENS, the on-chain intelligence assistant for crypto Twitter and the Base chain.',
   'You live inside a browser extension that reads any X profile and surfaces on-chain signals.',
-  'You can do three things: (1) analyze a contract address, (2) analyze an X account or deployer, and (3) chat and answer questions about LENS itself and about on-chain / crypto concepts.',
-  'Voice: friendly, sharp, plain English, lightly casual. Keep replies tight and scannable.',
-  'Rules: use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
-  'When you have token or account DATA, give a one-line bold summary, then 3 to 6 short bullets, then a final "Risk read: LOW | MEDIUM | HIGH" line with a short reason.',
-  'When the user asks about LENS features or how something works, answer from the LENS DOCS / KNOWLEDGE provided, briefly.',
-  'This is information, not financial advice. Never tell people to buy or sell.',
+  'Talk like a friendly, sharp human having a real conversation, similar to a helpful chat assistant. If the user just greets you or makes small talk (hi, hey, gm, how are you), reply warmly and naturally as if you are speaking with them, then gently offer to look up a token or an account.',
+  'You can do three things: (1) analyze a contract address or a $ticker (you can resolve a ticker to its token and report its deployer, fee share, and how many times the dev has claimed fees), (2) analyze an X account or deployer, (3) answer questions about LENS itself and about on-chain / crypto topics.',
+  'Stay on topic: LENS, on-chain and crypto, plus light friendly chat. If the user brings up sexual, pornographic, vulgar, hateful, illegal, or clearly unrelated content, do NOT engage with it. Briefly and politely decline and steer the conversation back to what LENS can help with.',
+  'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
+  'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets, then a final "Risk read: LOW | MEDIUM | HIGH" line. For normal conversation, just reply naturally in a sentence or two, no forced format.',
+  'Keep replies tight and plain English. This is information, not financial advice, and never tell people to buy or sell.',
 ].join(' ');
 
 const LENS_KNOWLEDGE = [
@@ -85,8 +87,11 @@ function detect(q) {
   if (urlH) return { type: 'handle', value: urlH[1].toLowerCase(), q: text };
   const atH = text.match(/@([A-Za-z0-9_]{1,15})/);
   if (atH) return { type: 'handle', value: atH[1].toLowerCase(), q: text };
-  const bare = text.match(/^([A-Za-z0-9_]{2,15})$/);
-  if (bare) return { type: 'handle', value: bare[1].toLowerCase(), q: text };
+  // $ticker / cashtag → resolve to a token via Dexscreener search
+  const tick = text.match(/\$([A-Za-z][A-Za-z0-9]{1,14})\b/);
+  if (tick) return { type: 'ticker', value: tick[1], q: text };
+  // No bare-word handle detection: a lone word like "hi" or "gm" is conversation,
+  // not a username. Handles must be written with @ (or an x.com link).
   return { type: 'freeform', value: null, q: text };
 }
 
@@ -101,21 +106,71 @@ async function getJSON(url, opts = {}, ms = 12000) {
   } catch (e) { clearTimeout(t); return null; }
 }
 
+async function sb(path) {
+  if (!SUPABASE_URL || !SUPABASE_ANON) return null;
+  return getJSON(`${SUPABASE_URL}/rest/v1/${path}`, {
+    headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` },
+  });
+}
+
+// CA -> Bankrbot launch record: deployer, fee share, claim count, unclaimed
+async function bankrByCA(ca) {
+  const c = ca.toLowerCase();
+  const rows = await sb(`bankr_launches?token_address=eq.${c}&select=*`);
+  if (!rows || !rows.length) return null;
+  const t = rows[0];
+  let claimCount = t.fee_claimed_count != null ? Number(t.fee_claimed_count) : null;
+  let claimedEth = null;
+  const dw = (t.deployer_wallet || '').toLowerCase();
+  if (/^0x[0-9a-f]{40}$/.test(dw)) {
+    const ch = await sb(`bankr_claim_history?deployer_wallet=eq.${dw}&select=total_eth_claimed,claim_count`);
+    if (ch && ch.length) {
+      claimedEth = ch.reduce((s, r) => s + parseFloat(r.total_eth_claimed || 0), 0);
+      const cc = ch.reduce((s, r) => s + parseInt(r.claim_count || 0, 10), 0);
+      if (cc) claimCount = cc;
+    }
+  }
+  const fw = (t.fee_recipient_wallet || '').toLowerCase();
+  return {
+    isBankr: true,
+    deployer_x: t.x_username || null,
+    fee_share: t.fee_share ?? null,
+    unclaimed_usd: t.unclaimed_usd ?? null,
+    has_claimed: !!t.fee_has_claimed || (claimCount != null && claimCount > 0),
+    claim_count: claimCount,
+    claimed_eth: claimedEth != null ? claimedEth.toFixed(4) : null,
+    is_pleasebro: !!(dw && fw && dw !== fw),
+  };
+}
+
+function bankrLines(b) {
+  const L = ['This is a Bankrbot token.'];
+  if (b.deployer_x) L.push('Deployer X: @' + b.deployer_x);
+  if (b.fee_share != null) L.push('Dev fee share: ' + b.fee_share);
+  if (b.claim_count != null) L.push('Dev fee claims: ' + b.claim_count + ' time(s)' + (b.claimed_eth ? ', ' + b.claimed_eth + ' ETH total' : ''));
+  else if (b.has_claimed) L.push('Dev has claimed fees at least once');
+  else L.push('No dev fee claims recorded yet');
+  if (b.unclaimed_usd && parseFloat(b.unclaimed_usd) > 0) L.push('Unclaimed fees: $' + b.unclaimed_usd);
+  if (b.is_pleasebro) L.push('Fee recipient differs from deployer (PleaseBro pattern)');
+  return L.join('. ');
+}
+
 // ── CA → token data via Dexscreener + Alchemy metadata ──
 async function gatherCA(ca) {
-  const [j, meta] = await Promise.all([
+  const [j, meta, bankr] = await Promise.all([
     getJSON(`https://api.dexscreener.com/latest/dex/tokens/${ca}`),
     getJSON(`${SELF}/api/alchemy`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ method: 'alchemy_getTokenMetadata', params: [ca] }),
     }),
+    bankrByCA(ca),
   ]);
   const md = (meta && meta.result) || {};
+  const basescan = `https://basescan.org/token/${ca}`;
   const pairs = (j && j.pairs) || [];
   if (!pairs.length) {
-    // no market yet, but metadata may still exist
-    if (md.name || md.symbol) return { found: true, ca, name: md.name, symbol: md.symbol, noMarket: true };
-    return { found: false, ca };
+    if (md.name || md.symbol || bankr) return { found: true, ca, name: md.name, symbol: md.symbol, noMarket: true, bankr, basescan };
+    return { found: false, ca, bankr, basescan };
   }
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
@@ -133,7 +188,24 @@ async function gatherCA(ca) {
     chg24: p.priceChange?.h24,
     ageDays, socials, websites: sites,
     txns24: p.txns?.h24 ? (p.txns.h24.buys || 0) + ' buys / ' + (p.txns.h24.sells || 0) + ' sells' : null,
+    dexUrl: p.url || null, basescan, bankr,
   };
+}
+
+// $ticker -> resolve to a token via Dexscreener search, then full CA analysis
+async function gatherTicker(sym) {
+  const j = await getJSON(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(sym)}`);
+  let pairs = (j && j.pairs) || [];
+  const symU = sym.toUpperCase();
+  pairs = pairs.filter(p => p.baseToken && (p.baseToken.symbol || '').toUpperCase() === symU);
+  if (!pairs.length) return { found: false, ticker: sym };
+  // prefer Base, then deepest liquidity
+  pairs.sort((a, b) => ((b.chainId === 'base' ? 1 : 0) - (a.chainId === 'base' ? 1 : 0)) || ((b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)));
+  const ca = pairs[0].baseToken.address;
+  const d = await gatherCA(ca);
+  d.resolvedFromTicker = sym;
+  d.matchCount = pairs.length;
+  return d;
 }
 
 // ── handle → on-chain intel (lookup) + smart followers + bio ──
@@ -171,18 +243,31 @@ async function gatherHandle(handle) {
 }
 
 function buildContext(det, data) {
-  if (det.type === 'ca') {
-    if (!data.found) return `Contract: ${det.value}\nNo trading pairs found on Dexscreener (could be brand new, no liquidity, or not on a tracked DEX).`;
-    return [
-      `Contract: ${data.ca}`,
-      `Token: ${data.name || '?'} (${data.symbol || '?'}) on ${data.chain || '?'} via ${data.dex || '?'}`,
-      `Price USD: ${data.priceUsd ?? '?'}`,
-      `FDV: ${data.fdv ?? '?'}   Liquidity: ${data.liquidity ?? '?'}`,
-      `24h volume: ${data.vol24 ?? '?'}   24h change: ${data.chg24 != null ? data.chg24 + '%' : '?'}`,
-      `24h buys/sells: ${data.txns24 ?? '?'}`,
-      `Pair age: ${data.ageDays != null ? data.ageDays + ' days' : '?'}`,
-      `Socials: ${data.socials}   Websites listed: ${data.websites}`,
-    ].join('\n');
+  if (det.type === 'ca' || det.type === 'ticker') {
+    if (!data.found) {
+      if (det.type === 'ticker') return `No token with ticker $${det.value} was found on Dexscreener. Politely ask the user to paste the contract address.`;
+      return `Contract: ${det.value}\nNo trading pairs found on Dexscreener (could be brand new, no liquidity, or not on a tracked DEX).` + (data.bankr ? '\n' + bankrLines(data.bankr) : '');
+    }
+    const lines = [];
+    if (data.resolvedFromTicker) lines.push(`Resolved ticker $${data.resolvedFromTicker} to this token${data.matchCount > 1 ? ` (best match by liquidity; ${data.matchCount} tokens share this ticker)` : ''}.`);
+    lines.push(`Contract: ${data.ca}`);
+    lines.push(`Token: ${data.name || '?'} (${data.symbol || '?'}) on ${data.chain || '?'} via ${data.dex || '?'}`);
+    if (!data.noMarket) {
+      lines.push(`Price USD: ${data.priceUsd ?? '?'}`);
+      lines.push(`FDV: ${data.fdv ?? '?'}   Liquidity: ${data.liquidity ?? '?'}`);
+      lines.push(`24h volume: ${data.vol24 ?? '?'}   24h change: ${data.chg24 != null ? data.chg24 + '%' : '?'}`);
+      lines.push(`24h buys/sells: ${data.txns24 ?? '?'}`);
+      lines.push(`Pair age: ${data.ageDays != null ? data.ageDays + ' days' : '?'}`);
+      lines.push(`Socials: ${data.socials}   Websites listed: ${data.websites}`);
+    } else {
+      lines.push('Token exists on-chain but no active trading pair / market data found yet.');
+    }
+    if (data.bankr) lines.push(bankrLines(data.bankr));
+    const src = [];
+    if (data.dexUrl) src.push('Dexscreener ' + data.dexUrl);
+    if (data.basescan) src.push('BaseScan ' + data.basescan);
+    if (src.length) lines.push('Sources: ' + src.join(' | '));
+    return lines.join('\n');
   }
   if (det.type === 'handle') {
     const lines = [`X account: @${data.handle}`];
@@ -251,6 +336,7 @@ export default async function handler(req, res) {
     let data = {};
     if (det.type === 'ca') data = await gatherCA(det.value);
     else if (det.type === 'handle') data = await gatherHandle(det.value);
+    else if (det.type === 'ticker') data = await gatherTicker(det.value);
 
     // load docs (cached) so LENS can answer product questions accurately
     const docs = await getDocs();
@@ -267,7 +353,7 @@ export default async function handler(req, res) {
 
     // current turn, with on-chain DATA appended when we looked something up
     let userContent = q;
-    if (det.type === 'ca' || det.type === 'handle') {
+    if (det.type === 'ca' || det.type === 'handle' || det.type === 'ticker') {
       userContent = q + '\n\n[LENS DATA for this lookup, use ONLY this for facts]\n' + buildContext(det, data);
     }
 
