@@ -3,6 +3,6 @@
     { "path": "/api/refresh-following", "schedule": "0 */6 * * *" }
   ],
   "functions": {
-    "api/refresh-following.js": { "maxDuration": 60 }
+    "api/refresh-following.js": { "maxDuration": 300 }
   }
 }
