@@ -105,6 +105,8 @@ async function getClanker(sortBy){
   const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
   return arr.map(o => {
     const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
+    // base only: the API already filters via chainId=8453, this is a belt-and-suspenders guard
+    if (o.chain_id != null && Number(o.chain_id) !== 8453) return null;
     // clanker market data lives under related.market: { price, marketCap }
     const m = (o.related && o.related.market) || o.market || o.marketData || o.market_data || {};
     return {
@@ -198,6 +200,7 @@ async function buildCoins(merged){
       name: d.name || x.name || d.sym || '?',
       price: d.price, mcap: d.mcap, vol24: d.vol24, ch24: d.ch24,
       img: x.img || d.img || null, url: d.url || null, pool: d.pool || null,
+      ts: x.ts || null,
       verdict: 'caution', trust: null,
     };
   });
