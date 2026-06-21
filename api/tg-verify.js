@@ -4,8 +4,9 @@
 
 import { randomBytes } from 'crypto';
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://irtfaxhvphjtqczswrck.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
+const SUPABASE_URL = process.env.LENS_SUPABASE_URL || process.env.SUPABASE_URL || 'https://irtfaxhvphjtqczswrck.supabase.co';
+const SUPABASE_KEY = process.env.LENS_SUPABASE_SERVICE_KEY
+  || process.env.SUPABASE_SERVICE_KEY
   || process.env.SUPABASE_SERVICE_ROLE_KEY
   || process.env.SUPABASE_KEY;
 
