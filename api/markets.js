@@ -23,6 +23,8 @@
 
 const LENS_API = process.env.LENS_API || 'https://lens-liard.vercel.app';
 const MAX = parseInt(process.env.MARKETS_MAX || '30', 10);
+const MIN_LIQ = parseFloat(process.env.MARKETS_MIN_LIQ || '2000'); // board: drop coins below this DexScreener liquidity (kills launchpad-only junk)
+const MAX_MCAP = parseFloat(process.env.MARKETS_MAX_MCAP || '1e10'); // drop absurd / broken market caps
 const NEW_WINDOW_MIN = parseInt(process.env.NEW_WINDOW_MIN || '120', 10); // freshness window for feed=new
 const BANKR_LAUNCHES = 'https://api.bankr.bot/token-launches';
 const CLANKER = 'https://www.clanker.world/api/tokens';
@@ -99,27 +101,36 @@ async function fetchJson(url, opts = {}, timeout = 5000){
 // GeckoTerminal is used only for OHLCV candles (see the candles route in the handler).
 // It is intentionally NOT used to source which coins appear on the board or the new feed.
 
-async function getClanker(sortBy){
-  const j = await fetchJson(`${CLANKER}?chainId=8453&sortBy=${sortBy}&sort=desc&limit=20&includeMarket=true`);
-  if (!j) return [];
-  const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
-  return arr.map(o => {
-    const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
-    // base only: the API already filters via chainId=8453, this is a belt-and-suspenders guard
-    if (o.chain_id != null && Number(o.chain_id) !== 8453) return null;
-    // clanker market data lives under related.market: { price, marketCap }
-    const m = (o.related && o.related.market) || o.market || o.marketData || o.market_data || {};
-    return {
-      address: String(a).toLowerCase(),
-      src: srcOf(o),
-      name: o.name || null,
-      sym: o.symbol || null,
-      img: ipfsToHttp(o.img_url || o.imageUrl || o.imageUri || o.image || null),
-      ts: tsOf(o),
-      cprice: num(m.price, m.priceUsd, m.price_usd, o.price_usd, o.priceUsd),
-      cmcap: num(m.marketCap, m.market_cap, m.fdv, o.market_cap, o.marketCap, o.fdv),
-    };
-  }).filter(Boolean);
+async function getClanker(sortBy, pages = 1){
+  let cursor = '', out = [];
+  for (let i = 0; i < pages; i++){
+    const url = `${CLANKER}?chainId=8453&sortBy=${sortBy}&sort=desc&limit=20&includeMarket=true${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const j = await fetchJson(url);
+    if (!j) break;
+    const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
+    if (!arr.length) break;
+    const mapped = arr.map(o => {
+      const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
+      // base only: the API already filters via chainId=8453, this is a belt-and-suspenders guard
+      if (o.chain_id != null && Number(o.chain_id) !== 8453) return null;
+      // clanker market data lives under related.market: { price, marketCap }
+      const m = (o.related && o.related.market) || o.market || o.marketData || o.market_data || {};
+      return {
+        address: String(a).toLowerCase(),
+        src: srcOf(o),
+        name: o.name || null,
+        sym: o.symbol || null,
+        img: ipfsToHttp(o.img_url || o.imageUrl || o.imageUri || o.image || null),
+        ts: tsOf(o),
+        cprice: num(m.price, m.priceUsd, m.price_usd, o.price_usd, o.priceUsd),
+        cmcap: num(m.marketCap, m.market_cap, m.fdv, o.market_cap, o.marketCap, o.fdv),
+      };
+    }).filter(Boolean);
+    out = out.concat(mapped);
+    cursor = (j && (j.cursor || j.nextCursor || j.next_cursor)) || '';
+    if (!cursor) break;
+  }
+  return out;
 }
 
 async function getBankr(){
@@ -188,27 +199,31 @@ function dedupe(list){
   return out;
 }
 
-// BOARD enrich: prefer live DexScreener data, but fall back to the launchpad's own
-// market price (Clanker carries price+mcap) so freshly deployed coins that DexScreener
-// has not indexed yet still populate the board. Only skip a coin with no price anywhere.
+// BOARD enrich: the main board (Top / High vol) requires a REAL DexScreener pool with
+// liquidity. Launchpad-only coins (no pool yet) are dropped here so junk micro-caps with a
+// garbage launchpad mcap and zero real volume never reach the board. Brand-new coins still
+// surface via the lenient feed=new path below.
 async function buildCoins(merged){
   if (!merged.length) return [];
   const dex = await getDex(merged.map(x => x.address));
   return merged.map(x => {
     const d = dex[x.address] || null;
-    const price = (d && d.price > 0) ? d.price : (x.cprice || 0);
-    if (!(price > 0)) return null; // no price on dex or launchpad -> shows once it gets priced
+    if (!d || !(d.price > 0)) return null;        // no real pool -> not on the main board
+    if (!(d._liq >= MIN_LIQ)) return null;         // too little liquidity -> junk
+    const mcap = d.mcap || x.cmcap || 0;
+    if (mcap > MAX_MCAP) return null;              // absurd / broken mcap
     return {
       address: x.address, src: x.src,
-      sym: (d && d.sym) || x.sym || '?',
-      name: (d && d.name) || x.name || (d && d.sym) || x.sym || '?',
-      price,
-      mcap: (d && d.mcap) || x.cmcap || 0,
-      vol24: (d && d.vol24) || 0,
-      ch24: (d && d.ch24) || 0,
-      img: x.img || (d && d.img) || null,
-      url: (d && d.url) || null,
-      pool: (d && d.pool) || null,
+      sym: d.sym || x.sym || '?',
+      name: d.name || x.name || d.sym || x.sym || '?',
+      price: d.price,
+      mcap,
+      vol24: d.vol24 || 0,
+      ch24: d.ch24 || 0,
+      img: x.img || d.img || null,
+      url: d.url || null,
+      pool: d.pool || null,
+      liq: d._liq || 0,
       ts: x.ts || null,
       verdict: 'caution', trust: null,
     };
@@ -293,16 +308,24 @@ export default async function handler(req, res){
       return res.status(200).json({ coins });
     }
 
-    // default board -> top volume across CLANKER + BANKR (no Gecko sourcing)
+    // default board -> CLANKER + BANKR, real DexScreener pools only, junk filtered.
+    // Pull several market-cap pages so established high-cap coins (incl. Bankr-via-Clanker)
+    // land in the pool, plus active (tx-h24) pages. The frontend re-sorts per tab
+    // (Top = market cap, High vol = 24h volume), so the board returns the union of the
+    // top coins by BOTH market cap and 24h volume, giving each tab a real ranking.
     const [cap, hot, bankr] = await Promise.all([
-      getClanker('market-cap'),
-      getClanker('tx-h24'),
+      getClanker('market-cap', 5),
+      getClanker('tx-h24', 2),
       getBankr(),
     ]);
     const merged = dedupe([ ...bankr, ...cap, ...hot ]); // bankr first => authoritative bankr tag; clanker fills
-    let coins = await buildCoins(merged);
-    coins.sort((a, b) => (b.vol24 || 0) - (a.vol24 || 0));
-    coins = coins.slice(0, MAX);
+    let coins = await buildCoins(merged); // real pool + liquidity only -> no junk
+
+    const byMcap = [...coins].sort((a, b) => (b.mcap || 0) - (a.mcap || 0)).slice(0, MAX);
+    const byVol  = [...coins].sort((a, b) => (b.vol24 || 0) - (a.vol24 || 0)).slice(0, MAX);
+    coins = dedupe([ ...byMcap, ...byVol ]).slice(0, MAX + 15);
+    coins.sort((a, b) => (b.mcap || 0) - (a.mcap || 0)); // default order; frontend re-sorts per tab
+
     await addVerdicts(coins);
     return res.status(200).json({ coins });
   } catch (e){
