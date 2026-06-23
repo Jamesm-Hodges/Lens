@@ -257,6 +257,14 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
     }
   } catch (e) {}
 
+  // ── Use the REAL dev wallet for activity attribution ──
+  // Bankr/Doppler tokens are deployed on-chain by Bankr's SHARED launcher wallet, so the
+  // contract deployer is NOT the project owner. The real dev is the fee recipient. Without
+  // this, the launcher's aggregate claims/sells across every token it ever launched get
+  // blamed on this one dev (e.g. a "54 ETH claimed" history that isn't theirs).
+  const realDevWallet = feeStructure?.fee_recipient_wallet || bankrDeployerWallet;
+  if (realDevWallet) deployerWallet = realDevWallet.toLowerCase();
+
   // Step 4: Query Bankrbot creator-fees by deployer wallet
   let creatorFees = null;
   if (deployerWallet) {
