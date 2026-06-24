@@ -117,27 +117,59 @@ async function indexLaunches() {
 
 async function checkAndSaveClaims(wallet, tokenAddress, tokenSymbol) {
   try {
-    // NOTE: this counts ALL incoming internal ETH transfers to `wallet`, not only
-    // Bankr fee claims. If total_eth_claimed looks inflated, filter by the Bankr
-    // fee contract as the `fromAddress` here.
-    const result = await alchemyRpc('alchemy_getAssetTransfers', [{
-      toAddress: wallet,
-      category: ['internal'],
-      order: 'desc',
-      withMetadata: true,
-      excludeZeroValue: true,
-      maxCount: '0x3e8',
-    }]);
-    const claims = (result?.transfers || []).filter(tx => (tx.value || 0) > 0);
+    // Bankr/Doppler fee claims are paid in WETH (ERC-20) + the project token — NOT
+    // native ETH. The old code only queried category:['internal'] (native ETH), so
+    // every WETH claim was invisible and total_eth_claimed stayed 0.
+    //
+    // A fee claim's signature: in the SAME tx the recipient wallet receives BOTH
+    // WETH and the project token. We pull WETH-in and token-in, group by tx hash,
+    // and count a claim only when both land in the same tx. This isolates claims
+    // from plain WETH receipts (swaps) and from buys (token in, WETH out).
+    const WETH_BASE = '0x4200000000000000000000000000000000000006';
+    const tok = String(tokenAddress || '').toLowerCase();
+
+    const [wethRes, tokenRes] = await Promise.all([
+      alchemyRpc('alchemy_getAssetTransfers', [{
+        toAddress: wallet, contractAddresses: [WETH_BASE], category: ['erc20'],
+        order: 'desc', withMetadata: true, excludeZeroValue: true, maxCount: '0x3e8',
+      }]),
+      alchemyRpc('alchemy_getAssetTransfers', [{
+        toAddress: wallet, contractAddresses: [tok], category: ['erc20'],
+        order: 'desc', withMetadata: true, excludeZeroValue: true, maxCount: '0x3e8',
+      }]),
+    ]);
+
+    const wethByTx = new Map();
+    for (const t of (wethRes?.transfers || [])) {
+      const h = String(t.hash || '').toLowerCase();
+      if (!h) continue;
+      wethByTx.set(h, {
+        weth: (wethByTx.get(h)?.weth || 0) + (t.value || 0),
+        ts: t.metadata?.blockTimestamp || null,
+      });
+    }
+
+    const claimTx = new Map();
+    for (const t of (tokenRes?.transfers || [])) {
+      const h = String(t.hash || '').toLowerCase();
+      if (!h || !wethByTx.has(h) || claimTx.has(h)) continue;
+      const g = wethByTx.get(h);
+      claimTx.set(h, { weth: g.weth, ts: t.metadata?.blockTimestamp || g.ts });
+    }
+
+    const claims = [...claimTx.values()];
     if (!claims.length) return;
-    const totalEth = claims.reduce((s, tx) => s + (tx.value || 0), 0);
-    const lastClaim = new Date(claims[0].metadata?.blockTimestamp || Date.now()).toISOString();
+    const totalWeth = claims.reduce((s, c) => s + (c.weth || 0), 0);
+    const lastClaim = new Date(
+      claims.map(c => c.ts).filter(Boolean).sort().pop() || Date.now()
+    ).toISOString();
+
     await supabaseUpsert('bankr_claim_history', {
       deployer_wallet: wallet,
       token_address: tokenAddress,
       token_symbol: tokenSymbol,
       claim_count: claims.length,
-      total_eth_claimed: totalEth.toFixed(6),
+      total_eth_claimed: totalWeth.toFixed(6),
       last_claimed_at: lastClaim,
       updated_at: new Date().toISOString(),
     });
