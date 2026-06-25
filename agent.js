@@ -21,20 +21,27 @@ const TWITTERAPI_KEY = process.env.TWITTERAPI_KEY;
 const SELF = 'https://lens-liard.vercel.app';
 const SUPABASE_URL = (process.env.LENS_SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_ANON = process.env.LENS_SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE = process.env.LENS_SUPABASE_SERVICE_KEY;
 
 // Only let our own surfaces call this (soft guard against random embeds / cost abuse).
 const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io', 'https://x.com', 'https://twitter.com', 'http://localhost'];
 
 const PERSONA = [
+  'CRITICAL LANGUAGE RULE: Always reply in English by default. NEVER reply in Indonesian or Malay under any circumstance, not even a single word or greeting, even if the user writes to you in Indonesian or Malay. For short greetings (hi, hai, gm, halo, hello), single words, emojis, or any ambiguous or mixed-language input, ALWAYS reply in English. Only switch to another language (Chinese, Russian, Spanish, French, Vietnamese, Thai, etc.) when the user writes a clear, substantial message fully in that specific language.',
   'You are LENS, the on-chain intelligence assistant for crypto Twitter and the Base chain.',
   'You live inside a browser extension that reads any X profile and surfaces on-chain signals.',
   'Talk like a friendly, sharp human having a real conversation, similar to a helpful chat assistant. If the user just greets you or makes small talk (hi, hey, gm, how are you), reply warmly and naturally as if you are speaking with them, then gently offer to look up a token or an account.',
   'You can do three things: (1) analyze a contract address or a $ticker (you can resolve a ticker to its token and report its deployer, fee share, and how many times the dev has claimed fees), (2) analyze an X account or deployer, (3) answer questions about LENS itself and about on-chain / crypto topics.',
   'Stay on topic: LENS, on-chain and crypto, plus light friendly chat. If the user brings up sexual, pornographic, vulgar, hateful, illegal, or clearly unrelated content, do NOT engage with it. Briefly and politely decline and steer the conversation back to what LENS can help with.',
   'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
-  'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
-  'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
-  'Reply in the same language the user writes in (for example English, Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. If the language is unclear or mixed, default to English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
+  'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle), and keep any role label shown in parentheses after a handle (for example "@jessepollak (Founder)"). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
+  'When analysing an X account and a Bio is provided, open by briefly saying who they appear to be based on that bio (their role or project, for example "Jesse Pollak, builder of Base"), using only what the bio states and never inventing a title. Then state clearly whether they have launched or hold any token: if the DATA lists tokens they launched or a contract address in their bio, name it; if none is listed, say they have no token on the tracked feed.',
+  'If the DATA includes CA history, report it: how many contract addresses are currently in the bio, and how many were REMOVED over time. Call out removed CAs as a warning sign (devs often delete a token CA from their bio after dumping). If none were removed, you can say the bio CA history looks clean.',
+  'If the DATA includes past usernames (handle change history), mention that the account previously went by those handles, and treat frequent handle changes as a mild caution signal. If the DATA includes an account location, state where the account says it is based (note it is self-reported and can be spoofed).',
+  'When the DATA says "This is a Bankrbot token", you MUST surface its fee facts in your bullets: the dev fee share, the dev fee claim count (or that there are none yet), and any unclaimed fees. Never silently drop these.',
+  'When the DATA includes token market stats (price, FDV or market cap, liquidity, 24h volume, 24h change, buys/sells), you MUST include the key ones in your bullets. Never drop the market data, even when there is also Bankrbot fee data to report: show BOTH the market stats and the fee facts.',
+  'Only when you actually have token or account DATA, format it as: one bold summary line, then 4 to 8 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
+  'Reply in English by default. Mirror another language only when the user clearly writes a full message in it (Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. For greetings, short, ambiguous, or mixed input, always use English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
   'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
 ].join(' ');
 
@@ -125,6 +132,47 @@ async function sb(path) {
   return getJSON(`${SUPABASE_URL}/rest/v1/${path}`, {
     headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` },
   });
+}
+
+// Upsert helper (service key) for the small amount of state the agent writes.
+async function sbWrite(table, row, onConflict) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE) return;
+  try {
+    const q = onConflict ? `?on_conflict=${onConflict}` : '';
+    await getJSON(`${SUPABASE_URL}/rest/v1/${table}${q}`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SERVICE, Authorization: `Bearer ${SUPABASE_SERVICE}`,
+        'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify(row),
+    });
+  } catch {}
+}
+
+const CA_RE_G = /0x[a-fA-F0-9]{40}/g;
+
+// CA history: record CAs seen in a profile's bio over time, and flag ones that
+// were present before but are gone now (classic post-pump rug / abandon signal).
+// Builds organically: each scan compares the current bio to what we've recorded.
+async function trackBioCAs(handle, currentCAs) {
+  const h = String(handle || '').toLowerCase().replace(/^@/, '');
+  if (!h || !SUPABASE_SERVICE) return null;
+  const now = new Date().toISOString();
+  const cur = [...new Set((currentCAs || []).map(s => String(s).toLowerCase()))].slice(0, 8);
+  try {
+    // mark every CA currently in the bio as present
+    for (const ca of cur) await sbWrite('bio_ca_history', { handle: h, ca, last_seen: now, removed: false }, 'handle,ca');
+    // load full recorded history for this handle
+    const rows = (await sb(`bio_ca_history?handle=eq.${encodeURIComponent(h)}&select=ca,removed`)) || [];
+    const curSet = new Set(cur);
+    // any previously-seen CA that is no longer in the bio = removed
+    for (const r of rows) {
+      if (!curSet.has(r.ca) && !r.removed) await sbWrite('bio_ca_history', { handle: h, ca: r.ca, removed: true }, 'handle,ca');
+    }
+    const removed = [...new Set(rows.filter(r => !curSet.has(r.ca)).map(r => r.ca))];
+    return { current: cur, removed, total_seen: cur.length + removed.length };
+  } catch { return null; }
 }
 
 // Live on-chain claim detection via the /api/alchemy proxy (matches FARGRAM).
@@ -363,15 +411,19 @@ async function gatherTicker(sym) {
 // ── handle → on-chain intel (lookup) + smart followers + bio ──
 async function gatherHandle(handle) {
   const out = { handle, found: false };
-  const [lk, sf, launches] = await Promise.all([
+  const [lk, sf, launches, uh] = await Promise.all([
     getJSON(`${SELF}/api/lookup?username=${encodeURIComponent(handle)}`),
     getJSON(`${SELF}/api/smart-followers?handle=${encodeURIComponent(handle)}`),
     bankrByHandle(handle),
+    getJSON(`${SELF}/api/lookup?username_history=${encodeURIComponent(handle)}`),
   ]);
   if (lk && lk.success && lk.data && lk.data.found) { out.found = true; out.intel = lk.data; }
   if (Array.isArray(launches) && launches.length) { out.launches = launches; out.found = true; }
   if (sf && Array.isArray(sf.followers)) {
-    out.smartFollowers = sf.followers.map(f => '@' + (f.handle || f)).slice(0, 20);
+    out.smartFollowers = sf.followers.map(f => {
+      const h = '@' + (f.handle || f);
+      return f && f.label ? `${h} (${f.label})` : h;
+    }).slice(0, 20);
     out.smartFollowerCount = sf.count || out.smartFollowers.length;
     if (out.smartFollowerCount) out.found = true;
   }
@@ -384,14 +436,22 @@ async function gatherHandle(handle) {
     const u = (info && (info.data || info.user || info)) || {};
     const name = u.name || u.displayName;
     const bio = u.description || u.bio;
+    const loc = u.location || u.locationName || (u.profile && u.profile.location);
+    if (loc) out.location = String(loc).slice(0, 80);
     if (name || bio) {
       out.found = true;
       out.name = name || null;
       out.bio = bio ? String(bio).slice(0, 280) : null;
       out.followers = u.followers != null ? fmtNum(u.followers) : (u.followersCount != null ? fmtNum(u.followersCount) : null);
-      const caInBio = (bio || '').match(CA_RE);
-      if (caInBio) out.bioCA = caInBio[0];
+      const bioCAs = bio ? [...new Set((String(bio).match(CA_RE_G) || []).map(s => s.toLowerCase()))] : [];
+      if (bioCAs.length) out.bioCA = bioCAs[0];
+      out.caHistory = await trackBioCAs(handle, bioCAs);
     }
+  }
+  // username history (memory.lol) — past handles this account used
+  if (uh && uh.changed && Array.isArray(uh.previous) && uh.previous.length) {
+    out.nameHistory = uh.previous.map(p => p.name).filter(Boolean).slice(0, 6);
+    out.found = true;
   }
   return out;
 }
@@ -432,8 +492,15 @@ function buildContext(det, data) {
     const lines = [`X account: @${data.handle}`];
     if (data.name) lines.push(`Name: ${data.name}`);
     if (data.followers) lines.push(`Followers: ${data.followers}`);
+    if (data.location) lines.push(`Account location (self-reported on X profile): ${data.location}`);
+    if (data.nameHistory && data.nameHistory.length) lines.push(`Past usernames this account previously used (handle change history): ${data.nameHistory.map(n => '@' + n).join(', ')}`);
     if (data.bio) lines.push(`Bio: ${data.bio}`);
     if (data.bioCA) lines.push(`Contract address in bio: ${data.bioCA}`);
+    if (data.caHistory) {
+      const ch = data.caHistory;
+      if (ch.current && ch.current.length) lines.push(`CAs currently in bio (${ch.current.length}): ${ch.current.join(', ')}`);
+      if (ch.removed && ch.removed.length) lines.push(`CAs REMOVED from bio over time (${ch.removed.length}), a classic post-pump rug / abandon signal: ${ch.removed.join(', ')}`);
+    }
     if (data.launches && data.launches.length) {
       const recent = data.launches.slice(0, 5).map(t => {
         const sym = t.symbol ? `$${t.symbol}` : (t.name || 'token');
@@ -557,6 +624,14 @@ export default async function handler(req, res) {
         return `${amt}[tx](https://basescan.org/tx/${x.hash})`;
       }).join(', ');
       answer += `\n\n**Claim txs:** ${links}`;
+    }
+
+    // Deterministic chart/explorer links for token lookups (always shown, clickable).
+    if (det.type === 'ca' || det.type === 'ticker') {
+      const L = [];
+      if (data && data.dexUrl) L.push(`[Chart](${data.dexUrl})`);
+      if (data && data.basescan) L.push(`[BaseScan](${data.basescan})`);
+      if (L.length) answer += `\n\n**Links:** ${L.join(' · ')}`;
     }
 
     return res.status(200).json({ ok: true, type: det.type, data, answer, model: LLM_MODEL });
