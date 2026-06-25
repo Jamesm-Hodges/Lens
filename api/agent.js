@@ -27,6 +27,7 @@ const SUPABASE_SERVICE = process.env.LENS_SUPABASE_SERVICE_KEY;
 const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io', 'https://x.com', 'https://twitter.com', 'http://localhost'];
 
 const PERSONA = [
+  'CRITICAL LANGUAGE RULE: Always reply in English by default. NEVER reply in Indonesian or Malay under any circumstance, not even a single word or greeting, even if the user writes to you in Indonesian or Malay. For short greetings (hi, hai, gm, halo, hello), single words, emojis, or any ambiguous or mixed-language input, ALWAYS reply in English. Only switch to another language (Chinese, Russian, Spanish, French, Vietnamese, Thai, etc.) when the user writes a clear, substantial message fully in that specific language.',
   'You are LENS, the on-chain intelligence assistant for crypto Twitter and the Base chain.',
   'You live inside a browser extension that reads any X profile and surfaces on-chain signals.',
   'Talk like a friendly, sharp human having a real conversation, similar to a helpful chat assistant. If the user just greets you or makes small talk (hi, hey, gm, how are you), reply warmly and naturally as if you are speaking with them, then gently offer to look up a token or an account.',
@@ -39,8 +40,9 @@ const PERSONA = [
   'If the DATA includes past usernames (handle change history), mention that the account previously went by those handles, and treat frequent handle changes as a mild caution signal. If the DATA includes an account location, state where the account says it is based (note it is self-reported and can be spoofed).',
   'When the DATA says "This is a Bankrbot token", you MUST surface its fee facts in your bullets: the dev fee share, the dev fee claim count (or that there are none yet), and any unclaimed fees. Never silently drop these.',
   'When the DATA includes token market stats (price, FDV or market cap, liquidity, 24h volume, 24h change, buys/sells), you MUST include the key ones in your bullets. Never drop the market data, even when there is also Bankrbot fee data to report: show BOTH the market stats and the fee facts.',
+  'When the DATA includes "Bundled wallets" or a "Funding trail", surface them: say how many early-buyer clusters share a funder and what percent of supply they hold (a high combined percent or a dev-funded cluster is a red flag), and note if the dev wallet funder fanned out to many sibling wallets. If no clusters were found, you can note that the early buyers look independent.',
   'Only when you actually have token or account DATA, format it as: one bold summary line, then 4 to 8 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
-  'Reply in the same language the user writes in (for example English, Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. If the language is unclear or mixed, default to English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
+  'Reply in English by default. Mirror another language only when the user clearly writes a full message in it (Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. For greetings, short, ambiguous, or mixed input, always use English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
   'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
 ].join(' ');
 
@@ -302,6 +304,28 @@ async function bankrByHandle(handle) {
   return list;
 }
 
+function onchainLines(oc) {
+  const out = [];
+  const c = oc && oc.cabal;
+  if (c) {
+    if (c.clusters && c.clusters.length) {
+      const top = c.clusters.slice(0, 3).map(cl => {
+        const tag = cl.funder_is_dev ? 'dev-funded' : 'shared funder';
+        const pct = cl.supply_pct != null ? `${cl.supply_pct}% of supply` : 'supply unknown';
+        return `${cl.count} wallets, ${tag}, ${pct}`;
+      });
+      out.push(`Bundled wallets: ${c.clusters.length} cluster(s) of early buyers share a common funder, holding ${c.total_pct}% of supply combined. Top clusters: ${top.join('; ')}.`);
+    } else if (c.note) {
+      out.push(`Bundled wallets: ${c.note}`);
+    }
+  }
+  const f = oc && oc.funding;
+  if (f && f.funder) {
+    out.push(`Funding trail: the dev wallet was first funded by ${f.funder}, which also sent ETH to ${f.fanout} other wallet(s)${f.fanout >= 5 ? ' (high fan-out, possible multi-wallet / sybil operation)' : ''}.`);
+  }
+  return out.join('\n');
+}
+
 function bankrLines(b) {
   const L = ['This is a Bankrbot token.'];
   if (b.deployer_x) L.push('Deployer X: @' + b.deployer_x);
@@ -364,9 +388,14 @@ async function gatherCA(ca) {
   const md = (meta && meta.result) || {};
   const basescan = `https://basescan.org/token/${ca}`;
   const pairs = (j && j.pairs) || [];
+  // Deep on-chain scan: bundle clusters + holder % + dev funding trail.
+  const deployer = (bankr && bankr.beneficiary) || null;
+  const onchain = (pairs.length || md.name || md.symbol || bankr)
+    ? await getJSON(`${SELF}/api/onchain?ca=${ca}${deployer ? `&deployer=${encodeURIComponent(deployer)}` : ''}`, {}, 25000)
+    : null;
   if (!pairs.length) {
-    if (md.name || md.symbol || bankr) return { found: true, ca, name: md.name, symbol: md.symbol, noMarket: true, bankr, basescan };
-    return { found: false, ca, bankr, basescan };
+    if (md.name || md.symbol || bankr) return { found: true, ca, name: md.name, symbol: md.symbol, noMarket: true, bankr, onchain, basescan };
+    return { found: false, ca, bankr, onchain, basescan };
   }
   pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
   const p = pairs[0];
@@ -387,7 +416,7 @@ async function gatherCA(ca) {
     liqRaw: p.liquidity?.usd ?? null, fdvRaw: p.fdv ?? null, vol24Raw: p.volume?.h24 ?? null,
     buys: p.txns?.h24?.buys ?? null, sells: p.txns?.h24?.sells ?? null,
     socialsCount: (p.info?.socials || []).length,
-    dexUrl: p.url || null, basescan, bankr,
+    dexUrl: p.url || null, basescan, bankr, onchain,
   };
 }
 
@@ -476,6 +505,7 @@ function buildContext(det, data) {
       lines.push('Token exists on-chain but no active trading pair / market data found yet.');
     }
     if (data.bankr) lines.push(bankrLines(data.bankr));
+    if (data.onchain) { const ol = onchainLines(data.onchain); if (ol) lines.push(ol); }
     if (!data.noMarket) {
       const rl = tokenRedLines(data);
       lines.push(`VERDICT: ${rl.verdict} (${rl.triggered} of ${rl.total} red lines triggered)`);
@@ -589,8 +619,15 @@ export default async function handler(req, res) {
     if (det.type === 'ca' || det.type === 'handle' || det.type === 'ticker') {
       userContent = q + '\n\n[LENS DATA for this lookup, use ONLY this for facts]\n' + buildContext(det, data);
     }
+    // Hard language lock at the user turn (recency beats any Indonesian in history).
+    userContent += '\n\n[Respond in English only. Never use Indonesian or Malay.]';
 
-    const messages = [{ role: 'system', content: systemContent }, ...hist, { role: 'user', content: userContent }];
+    const messages = [
+      { role: 'system', content: systemContent },
+      ...hist,
+      { role: 'user', content: userContent },
+      { role: 'system', content: 'Reply ONLY in English. Do not reply in Indonesian or Malay under any circumstance, even if earlier messages were in another language.' },
+    ];
 
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 25000);
