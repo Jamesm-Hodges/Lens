@@ -166,10 +166,15 @@ async function bankrFeesLive(ca) {
     const j = await getJSON(`https://api.bankr.bot/public/doppler/token-fees/${ca}?days=30`);
     const tok = j && j.tokens && j.tokens[0];
     if (!tok) return null;
+    const totals = j.totals || {};
     return {
-      recipient: String(tok.initializer || '').toLowerCase() || null,
+      // j.address is the resolved fee beneficiary; tok.initializer is the Doppler
+      // pool contract, NOT the recipient — using it was the earlier bug.
+      recipient: String(j.address || '').toLowerCase() || null,
       share: tok.share || null,
-      unclaimed_weth: tok.claimable?.token0 || null,
+      unclaimed_weth: totals.claimableWeth || tok.claimable?.token0 || null,
+      claimed_weth: totals.claimedWeth ?? tok.claimed?.token0 ?? null,
+      claim_count: totals.claimCount != null ? totals.claimCount : (tok.claimed?.count ?? null),
       lifetime_weth: j.lifetimeEarnedWeth || null,
     };
   } catch { return null; }
@@ -194,7 +199,12 @@ async function bankrByCA(ca) {
   let claimCount = t && t.fee_claimed_count != null ? Number(t.fee_claimed_count) : null;
   let claimedEth = null;
   let claimTxs = [];
-  // Live on-chain claim truth first; fall back to cron cache only for indexed tokens.
+  // Aged-out tokens: seed authoritative claim count + claimed weth from the Bankr API.
+  if (liveFee) {
+    if (liveFee.claim_count != null) claimCount = Number(liveFee.claim_count);
+    if (liveFee.claimed_weth != null) claimedEth = parseFloat(liveFee.claimed_weth);
+  }
+  // Live on-chain claim truth (also yields tx links); overrides when it finds claims.
   const live = await liveClaims(recipient, c);
   if (live) {
     claimCount = live.count;
@@ -249,9 +259,9 @@ function bankrLines(b) {
   const L = ['This is a Bankrbot token.'];
   if (b.deployer_x) L.push('Deployer X: @' + b.deployer_x);
   if (b.fee_share != null) L.push('Dev fee share: ' + b.fee_share);
-  if (b.claim_count != null) L.push('Dev fee claims: ' + b.claim_count + ' time(s)' + (b.claimed_eth ? ', ' + b.claimed_eth + ' ETH total' : ''));
+  if (b.claim_count != null && b.claim_count > 0) L.push('Dev fee claims: ' + b.claim_count + ' time(s)' + (b.claimed_eth ? ', ' + b.claimed_eth + ' ETH total' : ''));
   else if (b.has_claimed) L.push('Dev has claimed fees at least once');
-  else L.push('No dev fee claims recorded yet');
+  else L.push('No dev fee claims yet');
   if (b.unclaimed_usd && parseFloat(b.unclaimed_usd) > 0) L.push('Unclaimed fees: $' + b.unclaimed_usd);
   else if (b.unclaimed_weth && parseFloat(b.unclaimed_weth) > 0) L.push('Unclaimed fees: ' + b.unclaimed_weth + ' weth');
   if (b.is_pleasebro) L.push('Fee recipient differs from deployer (PleaseBro pattern)');
