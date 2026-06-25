@@ -17,7 +17,7 @@ import crypto from 'node:crypto';
 
 const LLM_KEY = process.env.LLM_API_KEY;
 const LLM_URL = (process.env.LLM_API_URL || 'https://api.venice.ai/api/v1').replace(/\/+$/, '');
-const LLM_MODEL = process.env.LLM_MODEL || 'llama-3.3-70b';
+const LLM_MODEL = process.env.LLM_MODEL || 'llama-3.2-3b';
 const SB_URL = process.env.LENS_SUPABASE_URL;
 const SB_KEY = process.env.LENS_SUPABASE_SERVICE_KEY;
 const CACHE_HOURS = 24;
@@ -93,27 +93,45 @@ export default async function handler(req, res) {
       (trust ? `Trust score: ${trust.score}/100 (${trust.label})\n` : '') +
       `LENS signals:\n${panel || '(none)'}`;
 
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 20000);
-    const r = await fetch(`${LLM_URL}/chat/completions`, {
-      method: 'POST',
-      signal: ctrl.signal,
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_KEY}` },
-      body: JSON.stringify({
-        model: LLM_MODEL,
-        temperature: 0.2,
-        max_tokens: 120,            // output is one short JSON line
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: userMsg },
-        ],
-      }),
-    });
-    clearTimeout(t);
+    // Call the provider with backoff. Venice returns 429 for rate-limit AND for
+    // "model overloaded", so a couple of spaced retries recovers most blips.
+    // Keep retries low — >20 failures in 30s triggers a 30s hard block.
+    const payload = {
+      model: LLM_MODEL,
+      temperature: 0.2,
+      max_tokens: 120,            // output is one short JSON line
+      messages: [
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: userMsg },
+      ],
+    };
+
+    let r, lastStatus = 0;
+    const delays = [0, 1500, 3500];   // 1 initial try + 2 retries
+    for (let i = 0; i < delays.length; i++) {
+      if (delays[i]) await new Promise(res => setTimeout(res, delays[i]));
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 20000);
+      try {
+        r = await fetch(`${LLM_URL}/chat/completions`, {
+          method: 'POST',
+          signal: ctrl.signal,
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_KEY}` },
+          body: JSON.stringify(payload),
+        });
+      } finally {
+        clearTimeout(t);
+      }
+      lastStatus = r.status;
+      if (r.status !== 429 && r.status !== 503) break;  // only retry overload/rate-limit
+    }
 
     if (!r.ok) {
       const txt = await r.text().catch(() => '');
-      return res.status(200).json({ success: false, error: `provider ${r.status}`, detail: txt.slice(0, 200) });
+      const hint = (lastStatus === 429)
+        ? 'rate-limited / model overloaded — try a smaller LLM_MODEL (e.g. llama-3.2-3b) or wait a moment'
+        : `provider ${lastStatus}`;
+      return res.status(200).json({ success: false, error: hint, status: lastStatus, detail: txt.slice(0, 200) });
     }
 
     const j = await r.json();
