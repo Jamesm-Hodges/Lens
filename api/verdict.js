@@ -7,17 +7,17 @@
 //      reuse the stored verdict for 24h = ZERO LLM cost on repeats.
 //   2. max_tokens capped low (output is one short JSON line).
 //   3. Input trimmed.
-//   Set LLM_MODEL to a small/cheap model for the biggest per-call saving.
+//   Set VERDICT_MODEL to a small/cheap model for the biggest per-call saving.
 //
 // Env required:  LLM_API_KEY
-// Env optional:  LLM_API_URL (default Venice), LLM_MODEL (default llama-3.3-70b)
+// Env optional:  LLM_API_URL (default Venice), VERDICT_MODEL (default llama-3.2-3b)
 // Env optional (cache): LENS_SUPABASE_URL, LENS_SUPABASE_SERVICE_KEY
 
 import crypto from 'node:crypto';
 
 const LLM_KEY = process.env.LLM_API_KEY;
 const LLM_URL = (process.env.LLM_API_URL || 'https://api.venice.ai/api/v1').replace(/\/+$/, '');
-const LLM_MODEL = process.env.LLM_MODEL || 'llama-3.2-3b';
+const VERDICT_MODEL = process.env.VERDICT_MODEL || 'llama-3.2-3b';
 const SB_URL = process.env.LENS_SUPABASE_URL;
 const SB_KEY = process.env.LENS_SUPABASE_SERVICE_KEY;
 const CACHE_HOURS = 24;
@@ -85,7 +85,7 @@ export default async function handler(req, res) {
     const key = cacheKey(username, panel, trust);
     const cached = await cacheGet(key);
     if (cached && cached.verdict) {
-      return res.status(200).json({ success: true, level: cached.level, verdict: cached.verdict, cached: true, model: LLM_MODEL });
+      return res.status(200).json({ success: true, level: cached.level, verdict: cached.verdict, cached: true, model: VERDICT_MODEL });
     }
 
     const userMsg =
@@ -97,7 +97,7 @@ export default async function handler(req, res) {
     // "model overloaded", so a couple of spaced retries recovers most blips.
     // Keep retries low — >20 failures in 30s triggers a 30s hard block.
     const payload = {
-      model: LLM_MODEL,
+      model: VERDICT_MODEL,
       temperature: 0.2,
       max_tokens: 120,            // output is one short JSON line
       messages: [
@@ -129,7 +129,7 @@ export default async function handler(req, res) {
     if (!r.ok) {
       const txt = await r.text().catch(() => '');
       const hint = (lastStatus === 429)
-        ? 'rate-limited / model overloaded — try a smaller LLM_MODEL (e.g. llama-3.2-3b) or wait a moment'
+        ? 'rate-limited / model overloaded — try a smaller VERDICT_MODEL (e.g. llama-3.2-3b) or wait a moment'
         : `provider ${lastStatus}`;
       return res.status(200).json({ success: false, error: hint, status: lastStatus, detail: txt.slice(0, 200) });
     }
@@ -142,7 +142,7 @@ export default async function handler(req, res) {
     const out = parseVerdict(raw);
     // 2) store for next time
     cacheSet(key, username, out.level, out.verdict);
-    return res.status(200).json({ success: true, ...out, model: LLM_MODEL });
+    return res.status(200).json({ success: true, ...out, model: VERDICT_MODEL });
   } catch (e) {
     return res.status(200).json({ success: false, error: String(e && e.message || e) });
   }
