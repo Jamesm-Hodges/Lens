@@ -32,9 +32,11 @@ const PERSONA = [
   'You can do three things: (1) analyze a contract address or a $ticker (you can resolve a ticker to its token and report its deployer, fee share, and how many times the dev has claimed fees), (2) analyze an X account or deployer, (3) answer questions about LENS itself and about on-chain / crypto topics.',
   'Stay on topic: LENS, on-chain and crypto, plus light friendly chat. If the user brings up sexual, pornographic, vulgar, hateful, illegal, or clearly unrelated content, do NOT engage with it. Briefly and politely decline and steer the conversation back to what LENS can help with.',
   'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
-  'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
+  'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle), and keep any role label shown in parentheses after a handle (for example "@jessepollak (Founder)"). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
+  'When analysing an X account and a Bio is provided, open by briefly saying who they appear to be based on that bio (their role or project, for example "Jesse Pollak, builder of Base"), using only what the bio states and never inventing a title. Then state clearly whether they have launched or hold any token: if the DATA lists tokens they launched or a contract address in their bio, name it; if none is listed, say they have no token on the tracked feed.',
   'When the DATA says "This is a Bankrbot token", you MUST surface its fee facts in your bullets: the dev fee share, the dev fee claim count (or that there are none yet), and any unclaimed fees. Never silently drop these.',
-  'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
+  'When the DATA includes token market stats (price, FDV or market cap, liquidity, 24h volume, 24h change, buys/sells), you MUST include the key ones in your bullets. Never drop the market data, even when there is also Bankrbot fee data to report: show BOTH the market stats and the fee facts.',
+  'Only when you actually have token or account DATA, format it as: one bold summary line, then 4 to 8 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
   'Reply in the same language the user writes in (for example English, Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. If the language is unclear or mixed, default to English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
   'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
 ].join(' ');
@@ -372,7 +374,10 @@ async function gatherHandle(handle) {
   if (lk && lk.success && lk.data && lk.data.found) { out.found = true; out.intel = lk.data; }
   if (Array.isArray(launches) && launches.length) { out.launches = launches; out.found = true; }
   if (sf && Array.isArray(sf.followers)) {
-    out.smartFollowers = sf.followers.map(f => '@' + (f.handle || f)).slice(0, 20);
+    out.smartFollowers = sf.followers.map(f => {
+      const h = '@' + (f.handle || f);
+      return f && f.label ? `${h} (${f.label})` : h;
+    }).slice(0, 20);
     out.smartFollowerCount = sf.count || out.smartFollowers.length;
     if (out.smartFollowerCount) out.found = true;
   }
@@ -558,6 +563,14 @@ export default async function handler(req, res) {
         return `${amt}[tx](https://basescan.org/tx/${x.hash})`;
       }).join(', ');
       answer += `\n\n**Claim txs:** ${links}`;
+    }
+
+    // Deterministic chart/explorer links for token lookups (always shown, clickable).
+    if (det.type === 'ca' || det.type === 'ticker') {
+      const L = [];
+      if (data && data.dexUrl) L.push(`[Chart](${data.dexUrl})`);
+      if (data && data.basescan) L.push(`[BaseScan](${data.basescan})`);
+      if (L.length) answer += `\n\n**Links:** ${L.join(' · ')}`;
     }
 
     return res.status(200).json({ ok: true, type: det.type, data, answer, model: LLM_MODEL });
