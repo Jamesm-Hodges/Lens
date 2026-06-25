@@ -33,6 +33,7 @@ const PERSONA = [
   'Stay on topic: LENS, on-chain and crypto, plus light friendly chat. If the user brings up sexual, pornographic, vulgar, hateful, illegal, or clearly unrelated content, do NOT engage with it. Briefly and politely decline and steer the conversation back to what LENS can help with.',
   'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
   'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
+  'When the DATA says "This is a Bankrbot token", you MUST surface its fee facts in your bullets: the dev fee share, the dev fee claim count (or that there are none yet), and any unclaimed fees. Never silently drop these.',
   'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
   'Reply in the same language the user writes in (for example English, Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. If the language is unclear or mixed, default to English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
   'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
@@ -159,23 +160,58 @@ async function liveClaims(recipient, tokenCA) {
 }
 
 // CA -> Bankrbot launch record: deployer, fee share, claim count, unclaimed
+// Bankr Doppler fee config by CA. Works for OLD tokens that aged out of the
+// 100-launch index (which is why $GITLAWB/$AEON showed no fee data before).
+async function bankrFeesLive(ca) {
+  try {
+    const j = await getJSON(`https://api.bankr.bot/public/doppler/token-fees/${ca}?days=30`);
+    const tok = j && j.tokens && j.tokens[0];
+    if (!tok) return null;
+    const totals = j.totals || {};
+    return {
+      // j.address is the resolved fee beneficiary; tok.initializer is the Doppler
+      // pool contract, NOT the recipient — using it was the earlier bug.
+      recipient: String(j.address || '').toLowerCase() || null,
+      share: tok.share || null,
+      unclaimed_weth: totals.claimableWeth || tok.claimable?.token0 || null,
+      claimed_weth: totals.claimedWeth ?? tok.claimed?.token0 ?? null,
+      claim_count: totals.claimCount != null ? totals.claimCount : (tok.claimed?.count ?? null),
+      lifetime_weth: j.lifetimeEarnedWeth || null,
+    };
+  } catch { return null; }
+}
+
 async function bankrByCA(ca) {
   const c = ca.toLowerCase();
   const rows = await sb(`bankr_launches?token_address=eq.${c}&select=*`);
-  if (!rows || !rows.length) return null;
-  const t = rows[0];
-  let claimCount = t.fee_claimed_count != null ? Number(t.fee_claimed_count) : null;
+  let t = (rows && rows.length) ? rows[0] : null;
+
+  // Aged-out fallback: pull live fee config from Bankr when not in our index.
+  let liveFee = null;
+  if (!t) {
+    liveFee = await bankrFeesLive(c);
+    if (!liveFee) return null;       // genuinely not a Bankr fee token
+  }
+
+  const dw = (t ? (t.deployer_wallet || '') : '').toLowerCase();
+  const fw = (t ? (t.fee_recipient_wallet || '') : (liveFee.recipient || '')).toLowerCase();
+  const recipient = fw || dw;
+
+  let claimCount = t && t.fee_claimed_count != null ? Number(t.fee_claimed_count) : null;
   let claimedEth = null;
-  const dw = (t.deployer_wallet || '').toLowerCase();
-  const fw = (t.fee_recipient_wallet || '').toLowerCase();
-  // Live first (real-time truth), fall back to cron cache if live finds nothing.
-  const live = await liveClaims(fw || dw, c);
   let claimTxs = [];
+  // Aged-out tokens: seed authoritative claim count + claimed weth from the Bankr API.
+  if (liveFee) {
+    if (liveFee.claim_count != null) claimCount = Number(liveFee.claim_count);
+    if (liveFee.claimed_weth != null) claimedEth = parseFloat(liveFee.claimed_weth);
+  }
+  // Live on-chain claim truth (also yields tx links); overrides when it finds claims.
+  const live = await liveClaims(recipient, c);
   if (live) {
     claimCount = live.count;
     claimedEth = live.weth;
     claimTxs = live.txs || [];
-  } else if (/^0x[0-9a-f]{40}$/.test(dw)) {
+  } else if (t && /^0x[0-9a-f]{40}$/.test(dw)) {
     const ch = await sb(`bankr_claim_history?deployer_wallet=eq.${dw}&select=total_eth_claimed,claim_count`);
     if (ch && ch.length) {
       claimedEth = ch.reduce((s, r) => s + parseFloat(r.total_eth_claimed || 0), 0);
@@ -183,16 +219,20 @@ async function bankrByCA(ca) {
       if (cc) claimCount = cc;
     }
   }
+
   return {
     isBankr: true,
-    deployer_x: t.x_username || null,
-    fee_share: t.fee_share ?? null,
-    unclaimed_usd: t.unclaimed_usd ?? null,
-    has_claimed: !!t.fee_has_claimed || (claimCount != null && claimCount > 0),
+    deployer_x: t ? (t.x_username || null) : null,
+    fee_share: t ? (t.fee_share ?? null) : (liveFee.share ?? null),
+    unclaimed_usd: t ? (t.unclaimed_usd ?? null) : null,
+    unclaimed_weth: t ? (t.fee_claimable_weth ?? t.unclaimed_weth ?? null) : (liveFee.unclaimed_weth ?? null),
+    beneficiary: recipient || null,
+    has_claimed: (t ? !!t.fee_has_claimed : false) || (claimCount != null && claimCount > 0),
     claim_count: claimCount,
     claimed_eth: claimedEth != null ? claimedEth.toFixed(4) : null,
     claim_txs: claimTxs,
     is_pleasebro: !!(dw && fw && dw !== fw),
+    aged_out: !t,
   };
 }
 
@@ -220,10 +260,11 @@ function bankrLines(b) {
   const L = ['This is a Bankrbot token.'];
   if (b.deployer_x) L.push('Deployer X: @' + b.deployer_x);
   if (b.fee_share != null) L.push('Dev fee share: ' + b.fee_share);
-  if (b.claim_count != null) L.push('Dev fee claims: ' + b.claim_count + ' time(s)' + (b.claimed_eth ? ', ' + b.claimed_eth + ' ETH total' : ''));
+  if (b.claim_count != null && b.claim_count > 0) L.push('Dev fee claims: ' + b.claim_count + ' time(s)' + (b.claimed_eth ? ', ' + b.claimed_eth + ' ETH total' : ''));
   else if (b.has_claimed) L.push('Dev has claimed fees at least once');
-  else L.push('No dev fee claims recorded yet');
+  else L.push('No dev fee claims yet');
   if (b.unclaimed_usd && parseFloat(b.unclaimed_usd) > 0) L.push('Unclaimed fees: $' + b.unclaimed_usd);
+  else if (b.unclaimed_weth && parseFloat(b.unclaimed_weth) > 0) L.push('Unclaimed fees: ' + b.unclaimed_weth + ' weth');
   if (b.is_pleasebro) L.push('Fee recipient differs from deployer (PleaseBro pattern)');
   return L.join('. ');
 }
@@ -512,9 +553,9 @@ export default async function handler(req, res) {
     const claimTxs = (data && data.bankr && data.bankr.claim_txs)
       || (data && data.claims && data.claims.claim_txs) || [];
     if (claimTxs.length) {
-      const links = claimTxs.slice(0, 6).map((x, i) => {
-        const label = x.weth ? `${Number(x.weth).toFixed(4)} weth` : `tx ${i + 1}`;
-        return `[${label}](https://basescan.org/tx/${x.hash})`;
+      const links = claimTxs.slice(0, 6).map((x) => {
+        const amt = x.weth ? `${Number(x.weth).toFixed(4)} weth ` : '';
+        return `${amt}[tx](https://basescan.org/tx/${x.hash})`;
       }).join(', ');
       answer += `\n\n**Claim txs:** ${links}`;
     }
